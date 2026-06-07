@@ -16,10 +16,15 @@ inputs:
     description: "Playbook macro (optional, for structured workflows) - should start with '!' (e.g., !my_playbook)"
     required: false
   prompt-text:
-    description: "Additional prompt text (optional)"
+    description: "Additional prompt text (optional). Mutually exclusive with prompt-file."
+    required: false
+  prompt-file:
+    description: "Path to a file containing the prompt text (optional, relative to the repository root). Use this instead of prompt-text to avoid YAML quoting/escaping issues with multi-line prompts. Mutually exclusive with prompt-text."
     required: false
   devin-token:
-    description: "Devin API Token (required for authentication)"
+    description: |
+      Devin API Token (required for authentication).
+      Requires a v3-compatible service user credential with ManageOrgSessions permission (service users only; PATs are not supported for v3).
     required: true
   github-token:
     description: "GitHub Token (required for posting comments and accessing repo context)"
@@ -29,20 +34,63 @@ inputs:
     required: false
     default: "🤖 **Starting Devin AI session...**"
   tags:
-    description: "Additional tags to apply to the Devin session (supports CSV or line-delimited format). Automatic tags are always added: gh-actions-trigger and playbook-{macro-name} if playbook-macro is provided"
+    description: "Additional tags to apply to the Devin session (supports CSV or line-delimited format). Automatic tags are always added: gh-actions-trigger and playbook-{macro-name} if playbook-macro is provided. Cannot be used with reuse-session."
+    required: false
+  reuse-session:
+    description: "Existing Devin session ID or URL to inject a message into (optional). When provided, sends a message to an existing v3 session instead of creating a new one. Accepts either a session ID or a full URL (e.g., https://app.devin.ai/sessions/abc123). Mutually exclusive with 'tags' input. Requires 'org-id'."
     required: false
   dry-run:
     description: "If 'true', the action will simulate the process without making an actual API call to Devin"
     required: false
     default: "false"
+  wait-for-stopped-status:
+    description: "If 'true', polls GET /v3/organizations/{org_id}/sessions/{devin_id} until status_detail is any non-working state."
+    required: false
+    default: "false"
+  wait-minutes-max:
+    description: "Maximum minutes to poll before timing out (only used when wait-for-stopped-status is enabled)"
+    required: false
+    default: "20"
+  api-version:
+    description: "Devin API version to use. Only 'v3' is supported; any other value fails fast."
+    required: false
+    default: "v3"
+  advanced-mode:
+    description: "V3 API advanced mode (optional). Enables specialized session behaviors for automation workflows. Options: 'analyze' (analyze existing sessions via session-links). Requires org-id."
+    required: false
+  session-links:
+    description: "Session URLs or IDs to provide as context (optional, supports CSV or line-delimited format). Required when advanced-mode is 'analyze'. When provided without advanced-mode, defaults to 'analyze' mode automatically."
+    required: false
+  org-id:
+    description: "Devin organization ID. Required for v3 session creation, session reuse, and polling."
+    required: true
+  max-acu-limit:
+    description: "Maximum ACU limit for the session (optional, v3 API only). Caps the compute budget for the session."
+    required: false
+  playbook-id:
+    description: "Playbook ID to use for the session (v3 API only). When set, the session will follow the referenced playbook's instructions. The playbook must already exist in the Devin API (synced via the ai-skills repo or created manually)."
+    required: false
+  child-playbook-id:
+    description: "Playbook ID for child sessions (v3 API only)."
+    required: false
+  bypass-approval:
+    description: "If 'true', bypass the approval step for session creation (v3 API only). Requires UseDevinExpert permission."
+    required: false
+    default: "false"
+  structured-output-schema:
+    description: "JSON Schema describing the structured output Devin should produce. Accepts YAML or JSON (YAML 1.2 is a superset of JSON, so plain JSON also works). Must parse to a top-level object. Ignored when using 'reuse-session'."
+    required: false
+  structured-output-required:
+    description: "If 'true', require Devin to submit final structured output before each turn ends. If 'false', structured output remains available but optional. Ignored when using 'reuse-session'."
+    required: false
 
 outputs:
   session-id:
     description: "The Devin session ID"
-    value: ${{ steps.devin-session.outputs.session-id }}
+    value: ${{ steps.inject-message.outputs.session-id || steps.create-session.outputs.session-id }}
   session-url:
     description: "The URL to view the Devin session"
-    value: ${{ steps.devin-session.outputs.session-url }}
+    value: ${{ steps.inject-message.outputs.session-url || steps.create-session.outputs.session-url }}
   prompt:
     description: "The base64-encoded prompt sent to Devin"
     value: ${{ steps.build-prompt.outputs.prompt }}
@@ -52,13 +100,145 @@ outputs:
   run-url:
     description: "The GitHub Actions run URL"
     value: ${{ steps.vars.outputs.run-url }}
+  status:
+    description: "The terminal status_detail value when polling completes (only set when wait-for-stopped-status is enabled)"
+    value: ${{ steps.wait-for-status.outputs.status }}
+  summary:
+    description: "The last message from the session (only set when wait-for-stopped-status is enabled)"
+    value: ${{ steps.wait-for-status.outputs.summary }}
+  structured-output:
+    description: "The session structured_output as compact JSON (only set when wait-for-stopped-status is enabled and the session has structured output)"
+    value: ${{ steps.wait-for-status.outputs.structured-output }}
 
 runs:
   using: "composite"
   steps:
 
+    - name: Validate inputs
+      shell: bash
+      env:
+        DEVIN_STRUCTURED_OUTPUT_SCHEMA: ${{ inputs.structured-output-schema }}
+      run: |
+        set -euo pipefail
+
+        # Check mutual exclusivity: reuse-session cannot be used with tags
+        if [[ -n "${{ inputs.reuse-session }}" && -n "${{ inputs.tags }}" ]]; then
+          echo "::error::The 'reuse-session' and 'tags' inputs are mutually exclusive. When injecting a message into an existing session, tags cannot be specified."
+          exit 1
+        fi
+
+        # Check mutual exclusivity: prompt-text and prompt-file
+        if [[ -n "${{ inputs.prompt-text }}" && -n "${{ inputs.prompt-file }}" ]]; then
+          echo "::error::The 'prompt-text' and 'prompt-file' inputs are mutually exclusive. Use one or the other, not both."
+          exit 1
+        fi
+
+        # Validate prompt-file exists if provided
+        if [[ -n "${{ inputs.prompt-file }}" ]]; then
+          if [[ ! -f "${{ inputs.prompt-file }}" ]]; then
+            echo "::error::The prompt-file '${{ inputs.prompt-file }}' does not exist."
+            exit 1
+          fi
+        fi
+
+        # Validate api-version input
+        api_version="${{ inputs.api-version }}"
+        if [[ "$api_version" != "v3" ]]; then
+          echo "::error::Invalid api-version '$api_version'. Devin API v1 support has been removed; api-version must be 'v3'."
+          exit 1
+        fi
+
+        # Validate v3 API inputs
+        advanced_mode="${{ inputs.advanced-mode }}"
+        session_links="${{ inputs.session-links }}"
+        org_id="${{ inputs.org-id }}"
+        structured_output_required="${{ inputs.structured-output-required }}"
+
+        # Determine effective advanced mode (session-links implies analyze)
+        if [[ -z "$advanced_mode" && -n "$session_links" ]]; then
+          advanced_mode="analyze"
+          echo "::notice::session-links provided without advanced-mode; defaulting to 'analyze' mode."
+        fi
+
+        # org-id is required for all v3 API calls
+        if [[ -z "$org_id" ]]; then
+          echo "::error::The 'org-id' input is required when using the v3 API."
+          exit 1
+        fi
+
+        # Validate advanced-mode value
+        if [[ -n "$advanced_mode" ]]; then
+          case "$advanced_mode" in
+            analyze)
+              echo "Advanced mode: $advanced_mode"
+              ;;
+            *)
+              echo "::error::Invalid advanced-mode '$advanced_mode'. Must be: analyze."
+              exit 1
+              ;;
+          esac
+        fi
+
+        # analyze mode requires session-links
+        if [[ "$advanced_mode" == "analyze" && -z "$session_links" ]]; then
+          echo "::error::The 'session-links' input is required when advanced-mode is 'analyze'."
+          exit 1
+        fi
+
+        if [[ -n "$structured_output_required" ]]; then
+          case "$structured_output_required" in
+            true|false)
+              ;;
+            *)
+              echo "::error::Invalid structured-output-required '$structured_output_required'. Must be either: true or false."
+              exit 1
+              ;;
+          esac
+          if [[ -z "$(printf '%s' "${DEVIN_STRUCTURED_OUTPUT_SCHEMA:-}" | tr -d '[:space:]')" ]]; then
+            echo "::warning::The 'structured-output-required' input was provided without 'structured-output-schema'. The v3 API flag will still be sent, but Devin will not have a schema to validate against."
+          fi
+          if [[ -n "${{ inputs.reuse-session }}" ]]; then
+            echo "::warning::The 'structured-output-required' input is only applied when creating a new v3 session; it will be ignored because 'reuse-session' is set."
+          fi
+        fi
+
+        # Validate structured-output-schema is a YAML or JSON object (if provided).
+        # Accept YAML input (YAML 1.2 is a superset of JSON, so plain JSON also parses).
+        # Normalize to compact JSON and persist via $GITHUB_ENV so downstream steps
+        # don't need to re-parse.
+        if [[ -n "$(printf '%s' "${DEVIN_STRUCTURED_OUTPUT_SCHEMA:-}" | tr -d '[:space:]')" ]]; then
+          schema_json=""
+          if command -v yq >/dev/null 2>&1; then
+            schema_json=$(printf '%s' "${DEVIN_STRUCTURED_OUTPUT_SCHEMA}" | yq -o=json eval '.' - 2>/dev/null) || schema_json=""
+          fi
+          if [[ -z "$schema_json" ]] && command -v python3 >/dev/null 2>&1; then
+            schema_json=$(printf '%s' "${DEVIN_STRUCTURED_OUTPUT_SCHEMA}" | python3 -c 'import sys, json; import yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout)' 2>/dev/null) || schema_json=""
+          fi
+          if [[ -z "$schema_json" ]]; then
+            # Last-ditch: try jq for pure JSON (covers runners without yq or PyYAML).
+            schema_json=$(printf '%s' "${DEVIN_STRUCTURED_OUTPUT_SCHEMA}" | jq -c '.' 2>/dev/null) || schema_json=""
+          fi
+          if [[ -z "$schema_json" ]]; then
+            echo "::error::Failed to parse 'structured-output-schema' as YAML or JSON. Runner needs 'yq', 'python3' with PyYAML, or valid JSON parseable by 'jq'."
+            exit 1
+          fi
+          if ! printf '%s' "$schema_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            echo "::error::The 'structured-output-schema' input must be a YAML or JSON object (got a non-object value)."
+            exit 1
+          fi
+          # Persist normalized compact JSON for the Create Session step.
+          schema_json_compact=$(printf '%s' "$schema_json" | jq -c '.')
+          echo "DEVIN_STRUCTURED_OUTPUT_SCHEMA_JSON=${schema_json_compact}" >> "$GITHUB_ENV"
+          if [[ -n "${{ inputs.reuse-session }}" ]]; then
+            echo "::warning::The 'structured-output-schema' input is only applied when creating a new session; it will be ignored because 'reuse-session' is set."
+          fi
+        fi
+
+        echo "Input validation passed (API version: v3)"
+
     - name: Build Devin prompt
       id: build-prompt
+      if: inputs.prompt-text != '' || inputs.prompt-file != '' || inputs.comment-id != '' || inputs.issue-number != '' || inputs.playbook-macro != ''
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -101,12 +281,21 @@ runs:
           prompt_parts+=("Please use playbook macro: ${{ inputs.playbook-macro }}")
         fi
 
+        # Add prompt from file if prompt-file is provided
+        if [[ -n "${{ inputs.prompt-file }}" ]]; then
+          echo "👀 Found 'prompt-file' input: ${{ inputs.prompt-file }}"
+          file_content=$(cat "${{ inputs.prompt-file }}")
+          if [[ -z "$file_content" ]]; then
+            echo "::error::The prompt-file '${{ inputs.prompt-file }}' is empty."
+            exit 1
+          fi
+          prompt_parts+=("$file_content")
         # Add custom prompt text if provided
-        if [[ -n "${{ inputs.prompt-text }}" ]]; then
+        elif [[ -n "${{ inputs.prompt-text }}" ]]; then
           echo "👀 Found 'prompt-text' input"
           prompt_parts+=("${{ inputs.prompt-text }}")
         else
-          echo "👀 No 'prompt-text' input found"
+          echo "👀 No 'prompt-text' or 'prompt-file' input found"
         fi
 
         echo "👀 Combining all ${#prompt_parts[@]} prompt parts"
@@ -159,18 +348,191 @@ runs:
           > ${{ inputs.start-message || '🤖 **Starting Devin AI session...**' }}
           >
 
-    - name: Create Devin session
-      id: devin-session
+    - name: Resolve session vars
+      id: resolve-vars
       shell: bash
       env:
-        DEVIN_TOKEN: ${{ inputs.devin-token }}
+        DEVIN_STRUCTURED_OUTPUT_SCHEMA: ${{ inputs.structured-output-schema }}
       run: |
         set -euo pipefail
 
-        echo "Creating Devin session..."
+        # ===== DEBUG: Print input summary =====
+        echo "::group::🔍 Input Summary"
+        echo "Mode: $([[ -n "${{ inputs.reuse-session }}" ]] && echo 'REUSE SESSION (inject message)' || echo 'CREATE NEW SESSION')"
+        echo "reuse-session: $([[ -n "${{ inputs.reuse-session }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "tags: $([[ -n "${{ inputs.tags }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "dry-run: ${{ inputs.dry-run }}"
+        echo "comment-id: $([[ -n "${{ inputs.comment-id }}" ]] && echo 'SET (${{ inputs.comment-id }})' || echo 'NOT SET')"
+        echo "issue-number: $([[ -n "${{ inputs.issue-number }}" ]] && echo 'SET (${{ inputs.issue-number }})' || echo 'NOT SET')"
+        echo "playbook-macro: $([[ -n "${{ inputs.playbook-macro }}" ]] && echo 'SET (${{ inputs.playbook-macro }})' || echo 'NOT SET')"
+        echo "prompt-text: $([[ -n "${{ inputs.prompt-text }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "prompt-file: $([[ -n "${{ inputs.prompt-file }}" ]] && echo 'SET (${{ inputs.prompt-file }})' || echo 'NOT SET')"
+        echo "advanced-mode: $([[ -n "${{ inputs.advanced-mode }}" ]] && echo 'SET (${{ inputs.advanced-mode }})' || echo 'NOT SET')"
+        echo "session-links: $([[ -n "${{ inputs.session-links }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "org-id: $([[ -n "${{ inputs.org-id }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "max-acu-limit: $([[ -n "${{ inputs.max-acu-limit }}" ]] && echo 'SET (${{ inputs.max-acu-limit }})' || echo 'NOT SET')"
+        echo "playbook-id: $([[ -n "${{ inputs.playbook-id }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "child-playbook-id: $([[ -n "${{ inputs.child-playbook-id }}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "bypass-approval: ${{ inputs.bypass-approval }}"
+        echo "structured-output-required: $([[ -n "${{ inputs.structured-output-required }}" ]] && echo 'SET (${{ inputs.structured-output-required }})' || echo 'NOT SET')"
+        echo "api-version: ${{ inputs.api-version }}"
+        echo "structured-output-schema: $([[ -n "${DEVIN_STRUCTURED_OUTPUT_SCHEMA:-}" ]] && echo 'SET' || echo 'NOT SET')"
+        echo "::endgroup::"
 
-        # Decode the base64-encoded prompt to handle special characters safely
+        # Parse reuse-session input if provided
+        if [[ -n "${{ inputs.reuse-session }}" ]]; then
+          reuse_input="${{ inputs.reuse-session }}"
+          
+          echo "::group::🔄 Session Reuse Configuration"
+          echo "Raw reuse-session input: $reuse_input"
+          
+          # Parse session ID from URL if a URL is provided
+          if [[ "$reuse_input" == *"app.devin.ai/sessions/"* ]]; then
+            # Extract session ID from URL (e.g., https://app.devin.ai/sessions/abc123)
+            session_id=$(echo "$reuse_input" | sed 's|.*app.devin.ai/sessions/||' | sed 's|[?#].*||')
+            echo "Input type: URL"
+            echo "Parsed session ID: $session_id"
+          else
+            # Assume it's already a session ID
+            session_id="$reuse_input"
+            echo "Input type: Session ID (direct)"
+          fi
+          
+          # Validate that session_id is not empty after parsing
+          if [[ -z "$session_id" ]]; then
+            echo "::error::Failed to extract session ID from reuse-session input: '$reuse_input'"
+            exit 1
+          fi
+          
+          session_url="https://app.devin.ai/sessions/${session_id}"
+          echo "Final session ID: $session_id"
+          echo "Final session URL: $session_url"
+          echo "API endpoint: POST /v3/organizations/{org_id}/sessions/devin-${session_id}/messages"
+          echo "::endgroup::"
+          
+          # Output resolved values
+          echo "session-id=$session_id" >> $GITHUB_OUTPUT
+          echo "session-url=$session_url" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Inject message into existing session
+      id: inject-message
+      if: inputs.reuse-session != '' && steps.build-prompt.outputs.prompt != ''
+      shell: bash
+      env:
+        DEVIN_TOKEN: ${{ inputs.devin-token }}
+        DEVIN_ORG_ID: ${{ inputs.org-id }}
+      run: |
+        set -euo pipefail
+
+        # Get resolved session vars
+        session_id="${{ steps.resolve-vars.outputs.session-id }}"
+        session_url="${{ steps.resolve-vars.outputs.session-url }}"
+
+        echo "Injecting message into existing Devin session..."
+        echo "Session ID: $session_id"
+        echo "Session URL: $session_url"
+        echo "Org ID: ${DEVIN_ORG_ID:-(not set)}"
+
+        # Decode the base64-encoded prompt
         decoded_prompt=$(echo "${{ steps.build-prompt.outputs.prompt }}" | base64 -d || { echo "Error: Failed to decode base64 prompt"; exit 1; })
+        echo "Prompt length: ${#decoded_prompt} characters"
+
+        # Prepare the message API request payload
+        jq -n \
+          --arg message "$decoded_prompt" \
+          '{
+            "message": $message
+          }' > devin_request.json
+
+        echo "::group::📤 Devin Message API Request"
+        cat devin_request.json | jq
+        echo "::endgroup::"
+
+        if [[ "${{ inputs.dry-run }}" == 'true' ]]; then
+          echo "👀 Dry run enabled, exiting early before making API call"
+          echo "::group::📤 Action Outputs (dry-run)"
+          echo "session-id=$session_id"
+          echo "session-url=$session_url"
+          echo "::endgroup::"
+          echo "session-id=$session_id" >> $GITHUB_OUTPUT
+          echo "session-url=$session_url" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        devin_id="devin-${session_id}"
+        api_url="https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions/${devin_id}/messages"
+        echo "Using v3 message endpoint: POST /v3/organizations/{org_id}/sessions/${devin_id}/messages"
+
+        # Make API call to send message to existing session
+        response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+          -H "Authorization: Bearer ${DEVIN_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d @devin_request.json \
+          "$api_url")
+
+        # Extract HTTP status code
+        http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d':' -f2)
+        response_body=$(echo "$response" | sed '/HTTP_STATUS:/d')
+
+        echo "::group::📥 Devin API Response"
+        echo "HTTP Status: $http_status"
+        echo "$response_body" | jq . 2>/dev/null || echo "$response_body"
+        echo "::endgroup::"
+
+        if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+          echo "Message injected successfully into Devin session!"
+          echo "::group::📤 Action Outputs"
+          echo "session-id=$session_id"
+          echo "session-url=$session_url"
+          echo "::endgroup::"
+          echo "session-id=$session_id" >> $GITHUB_OUTPUT
+          echo "session-url=$session_url" >> $GITHUB_OUTPUT
+        else
+          echo "::error::Failed to inject message into Devin session. HTTP Status: $http_status"
+          echo "Response: $response_body"
+          exit 1
+        fi
+
+    - name: Create new Devin session
+      id: create-session
+      if: inputs.reuse-session == ''
+      shell: bash
+      env:
+        DEVIN_TOKEN: ${{ inputs.devin-token }}
+        DEVIN_STRUCTURED_OUTPUT_SCHEMA: ${{ inputs.structured-output-schema }}
+      run: |
+        set -euo pipefail
+
+        advanced_mode="${{ inputs.advanced-mode }}"
+        session_links_input="${{ inputs.session-links }}"
+        org_id="${{ inputs.org-id }}"
+        max_acu_limit="${{ inputs.max-acu-limit }}"
+        playbook_id="${{ inputs.playbook-id }}"
+        child_playbook_id="${{ inputs.child-playbook-id }}"
+        bypass_approval="${{ inputs.bypass-approval }}"
+        structured_output_required="${{ inputs.structured-output-required }}"
+
+        # session-links without advanced-mode defaults to analyze
+        if [[ -z "$advanced_mode" && -n "$session_links_input" ]]; then
+          advanced_mode="analyze"
+        fi
+
+        api_endpoint="https://api.devin.ai/v3/organizations/${org_id}/sessions"
+
+        echo "::group::🆕 New Session Configuration (v3 API)"
+        echo "API endpoint: POST /v3/organizations/{org_id}/sessions"
+        echo "Advanced mode: $advanced_mode"
+        echo "Organization ID: $org_id"
+        echo "Repository: ${{ github.repository }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "::endgroup::"
+
+        echo "Creating new Devin session..."
+
+        # Decode the base64-encoded prompt
+        decoded_prompt=$(echo "${{ steps.build-prompt.outputs.prompt }}" | base64 -d || { echo "Error: Failed to decode base64 prompt"; exit 1; })
+        echo "Prompt length: ${#decoded_prompt} characters"
 
         # Build automatic tags
         automatic_tags=("gh-actions-trigger")
@@ -209,34 +571,55 @@ runs:
         # Convert to JSON array
         tags_array=$(printf '%s\n' "${all_tags[@]}" | jq -R . | jq -s .)
 
-        # Build metadata object with optional fields
-        metadata_json=$(jq -n \
-          --arg run_id "${{ github.run_id }}" \
-          --arg repository "${{ github.repository }}" \
-          --arg comment_id "${{ inputs.comment-id }}" \
-          --arg issue_number "${{ inputs.issue-number }}" \
-          '{
-            "github_run_id": $run_id,
-            "github_repository": $repository,
-            "triggered_by": "github_action"
-          }
-          | if $comment_id != "" then . + {"github_comment_id": $comment_id, "github_comment_url": "https://github.com/\($repository)/issues/comments/\($comment_id)"} else . end
-          | if $issue_number != "" then . + {"github_issue_number": $issue_number, "github_issue_url": "https://github.com/\($repository)/issues/\($issue_number)"} else . end')
+        # Use the normalized JSON persisted by the Validate inputs step.
+        # This is already compact JSON and known to be a top-level object.
+        structured_output_schema_json="${DEVIN_STRUCTURED_OUTPUT_SCHEMA_JSON:-null}"
+        if [[ -z "$structured_output_required" && "$structured_output_schema_json" != "null" ]]; then
+          structured_output_required="true"
+        fi
 
-        # Prepare the API request payload using jq to properly escape JSON
+        # Parse session-links (supports CSV and line-delimited)
+        session_links_json="null"
+        if [[ -n "$session_links_input" ]]; then
+          session_links_arr=()
+          while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+              IFS=',' read -ra link_array <<< "$line"
+              for link in "${link_array[@]}"; do
+                trimmed_link=$(echo "$link" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -n "$trimmed_link" ]]; then
+                  session_links_arr+=("$trimmed_link")
+                fi
+              done
+            fi
+          done <<< "$session_links_input"
+          session_links_json=$(printf '%s\n' "${session_links_arr[@]}" | jq -R . | jq -s .)
+        fi
+
+        # Build v3 request payload
         jq -n \
           --arg prompt "$decoded_prompt" \
-          --arg repo_url "https://github.com/${{ github.repository }}" \
-          --arg branch "${{ github.ref_name }}" \
+          --arg advanced_mode "$advanced_mode" \
           --argjson tags "$tags_array" \
-          --argjson metadata "$metadata_json" \
+          --argjson session_links "$session_links_json" \
+          --arg max_acu "$max_acu_limit" \
+          --arg playbook "$playbook_id" \
+          --arg child_playbook "$child_playbook_id" \
+          --arg bypass "$bypass_approval" \
+          --arg structured_output_required "$structured_output_required" \
+          --argjson structured_output_schema "$structured_output_schema_json" \
           '{
             "prompt": $prompt,
-            "repository_url": $repo_url,
-            "branch": $branch,
-            "tags": $tags,
-            "metadata": $metadata
-          }' > devin_request.json
+            "tags": $tags
+          }
+          | if $advanced_mode != "" then . + {"advanced_mode": $advanced_mode} else . end
+          | if $session_links != null then . + {"session_links": $session_links} else . end
+          | if $max_acu != "" then . + {"max_acu_limit": ($max_acu | tonumber)} else . end
+          | if $playbook != "" then . + {"playbook_id": $playbook} else . end
+          | if $child_playbook != "" then . + {"child_playbook_id": $child_playbook} else . end
+          | if $bypass == "true" then . + {"bypass_approval": true} else . end
+          | if $structured_output_required != "" then . + {"structured_output_required": ($structured_output_required == "true")} else . end
+          | if $structured_output_schema != null then . + {"structured_output_schema": $structured_output_schema} else . end' > devin_request.json
 
         echo "::group::📤 Devin API Request"
         cat devin_request.json | jq
@@ -244,42 +627,184 @@ runs:
 
         if [[ "${{ inputs.dry-run }}" == 'true' ]]; then
           echo "👀 Dry run enabled, exiting early before making API call"
-          echo "👀 Request payload:"
-          cat devin_request.json | jq
           exit 0
         fi
 
         # Make API call to Devin
-        response=$(curl -s -X POST \
+        response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
           -H "Authorization: Bearer ${DEVIN_TOKEN}" \
           -H "Content-Type: application/json" \
           -d @devin_request.json \
-          "https://api.devin.ai/v1/sessions" || echo "API_CALL_FAILED")
+          "$api_endpoint" || echo "API_CALL_FAILED")
 
         if [[ "$response" == "API_CALL_FAILED" ]]; then
           echo "Failed to call Devin API"
           exit 1
         fi
 
+        http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d':' -f2)
+        response_body=$(echo "$response" | sed '/HTTP_STATUS:/d')
+
         echo "::group::📥 Devin API Response"
-        echo "$response" | jq
+        echo "HTTP Status: $http_status"
+        echo "$response_body" | jq . 2>/dev/null || echo "$response_body"
         echo "::endgroup::"
 
+        if [[ -z "$http_status" || "$http_status" -lt 200 || "$http_status" -ge 300 ]]; then
+          echo "::error::Failed to create Devin session. HTTP Status: ${http_status:-unknown}"
+          echo "Response: $response_body"
+          exit 1
+        fi
+
         # Extract session information
-        session_id=$(echo "$response" | jq -r '.session_id // .id // empty')
-        session_url=$(echo "$response" | jq -r '.session_url // .url // empty')
+        session_id=$(echo "$response_body" | jq -r '.session_id // empty')
+        session_url=$(echo "$response_body" | jq -r '.url // empty')
 
         if [[ -z "$session_id" ]]; then
           echo "Failed to extract session ID from Devin API response"
+          echo "Response: $response_body"
           exit 1
         fi
 
         echo "Devin session created successfully!"
-        echo "Session ID: $session_id"
-        echo "Session URL: $session_url"
+        echo "::group::📤 Action Outputs"
+        echo "session-id=$session_id"
+        echo "session-url=$session_url"
+        echo "::endgroup::"
 
         echo "session-id=$session_id" >> $GITHUB_OUTPUT
         echo "session-url=$session_url" >> $GITHUB_OUTPUT
+
+    - name: Wait for session status
+      id: wait-for-status
+      if: inputs.wait-for-stopped-status == 'true' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        DEVIN_TOKEN: ${{ inputs.devin-token }}
+      run: |
+        set -euo pipefail
+
+        # Resolve the session ID from whichever earlier step produced it
+        session_id="${{ steps.inject-message.outputs.session-id || steps.create-session.outputs.session-id || steps.resolve-vars.outputs.session-id }}"
+        if [[ -z "$session_id" ]]; then
+          echo "::error::No session ID available for polling. Ensure a session was created or reused."
+          exit 1
+        fi
+
+        org_id="${{ inputs.org-id }}"
+        devin_id="devin-${session_id}"
+
+        # Internal defaults
+        poll_interval=30
+        max_api_errors=3
+        # Derive max polls from user-configurable wait-minutes-max
+        wait_minutes="${{ inputs.wait-minutes-max }}"
+        if ! [[ "$wait_minutes" =~ ^[0-9]+$ ]] || (( wait_minutes <= 0 )); then
+          echo "::error::wait-minutes-max must be a positive integer, got '$wait_minutes'."
+          exit 1
+        fi
+        max_polls=$(( (wait_minutes * 60 + poll_interval - 1) / poll_interval ))
+        consecutive_errors=0
+        poll_count=0
+
+        echo "::group::⏳ Polling Configuration"
+        echo "Session ID: $session_id"
+        echo "API endpoint: GET /v3/organizations/{org_id}/sessions/${devin_id}"
+        echo "Waiting for any non-working status_detail"
+        echo "Poll interval: ${poll_interval}s"
+        echo "Max polls: $max_polls"
+        echo "Max consecutive API errors: $max_api_errors"
+        echo "::endgroup::"
+
+        while true; do
+          poll_count=$((poll_count + 1))
+          if [[ $poll_count -gt $max_polls ]]; then
+            echo "::error::Polling timed out after $max_polls polls ($((max_polls * poll_interval))s)."
+            exit 1
+          fi
+
+          echo "Poll $poll_count/$max_polls — fetching session status..."
+
+          response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET \
+            -H "Authorization: Bearer ${DEVIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.devin.ai/v3/organizations/${org_id}/sessions/${devin_id}" 2>&1) || true
+
+          http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d':' -f2)
+          response_body=$(echo "$response" | sed '/HTTP_STATUS:/d')
+
+          # Handle API errors
+          if [[ -z "$http_status" || "$http_status" -lt 200 || "$http_status" -ge 300 ]]; then
+            consecutive_errors=$((consecutive_errors + 1))
+            echo "::warning::API error (attempt $consecutive_errors/$max_api_errors). HTTP status: ${http_status:-unknown}"
+            if [[ $consecutive_errors -ge $max_api_errors ]]; then
+              echo "::error::Aborting after $max_api_errors consecutive API errors."
+              exit 1
+            fi
+            echo "Retrying in ${poll_interval}s..."
+            sleep "$poll_interval"
+            continue
+          fi
+
+          # Reset consecutive error counter on success
+          consecutive_errors=0
+
+          # Extract status_detail from response, treating JSON parse failures as retryable errors
+          if ! current_status=$(echo "$response_body" | jq -r '.status_detail // empty' 2>/dev/null); then
+            consecutive_errors=$((consecutive_errors + 1))
+            echo "::warning::Failed to parse JSON response (attempt $consecutive_errors/$max_api_errors)."
+            if [[ $consecutive_errors -ge $max_api_errors ]]; then
+              echo "::error::Aborting after $max_api_errors consecutive parse errors."
+              exit 1
+            fi
+            sleep "$poll_interval"
+            continue
+          fi
+          echo "  Current status_detail: $current_status"
+
+          # Any non-working status_detail means the session has stopped
+          if [[ "$current_status" != "working" && -n "$current_status" ]]; then
+            echo "Session reached non-working status: $current_status"
+
+            # Extract outputs
+            echo "::group::📥 Final Session Response"
+            echo "$response_body" | jq .
+            echo "::endgroup::"
+
+            # Output: status
+            echo "status=$current_status" >> $GITHUB_OUTPUT
+
+            # Output: summary (last message)
+            last_message=$(echo "$response_body" | jq -r '
+              if .messages and (.messages | length) > 0 then
+                .messages[-1].message // ""
+              else
+                ""
+              end
+            ')
+            # Use heredoc with unique delimiter for multi-line summary
+            summary_delim="DEVIN_EOF_${RANDOM}_$(date +%s)"
+            echo "summary<<$summary_delim" >> $GITHUB_OUTPUT
+            printf '%s' "$last_message" >> $GITHUB_OUTPUT
+            echo >> $GITHUB_OUTPUT
+            echo "$summary_delim" >> $GITHUB_OUTPUT
+
+            # Output: structured-output (compact JSON)
+            if echo "$response_body" | jq -e 'has("structured_output") and .structured_output != null' >/dev/null; then
+              structured_output=$(echo "$response_body" | jq -c '.structured_output')
+              structured_output_delim="DEVIN_STRUCTURED_OUTPUT_EOF_${RANDOM}_$(date +%s)"
+              echo "structured-output<<$structured_output_delim" >> $GITHUB_OUTPUT
+              printf '%s' "$structured_output" >> $GITHUB_OUTPUT
+              echo >> $GITHUB_OUTPUT
+              echo "$structured_output_delim" >> $GITHUB_OUTPUT
+            fi
+
+            exit 0
+          fi
+
+          echo "  Still working. Sleeping ${poll_interval}s..."
+          sleep "$poll_interval"
+        done
 
     - name: Append success comment
       if: steps.comment-start.outputs.comment-id && success()
@@ -289,9 +814,9 @@ runs:
         comment-id: ${{ steps.comment-start.outputs.comment-id }}
         reactions: hooray
         body: |
-          > - 🔗 **Session URL:** ${{ steps.devin-session.outputs.session-url }}
+          > - 🔗 **Session URL:** ${{ steps.inject-message.outputs.session-url || steps.create-session.outputs.session-url }}
           >
-          > ✅ **Devin AI session created successfully!**
+          > ✅ **Devin AI session ${{ inputs.reuse-session != '' && 'message sent' || 'created' }} successfully!**
 
     - name: Append failure comment
       if: failure() && steps.comment-start.outputs.comment-id
@@ -301,7 +826,7 @@ runs:
         comment-id: ${{ steps.comment-start.outputs.comment-id }}
         reactions: confused
         body: |
-          > ❌ **Failed to create Devin AI session.**
+          > ❌ **Failed to ${{ inputs.reuse-session != '' && 'send message to' || 'create' }} Devin AI session.**
           >
           > - ⚙️ [Link to job logs.](${{ steps.vars.outputs.run-url }})
           >
